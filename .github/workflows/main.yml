@@ -1,0 +1,117 @@
+name: Coznt Codex PR Review
+run-name: "Codex review for PR #${{ inputs.pull_number }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: Pull request number
+        required: true
+        type: string
+      pr_title:
+        description: Pull request title
+        required: true
+        type: string
+      pr_url:
+        description: Pull request URL
+        required: true
+        type: string
+      base_sha:
+        description: Pull request base commit
+        required: true
+        type: string
+      head_sha:
+        description: Pull request head commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coznt-codex-pr-review-${{ inputs.pull_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Run Codex code review
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      final_message: ${{ steps.codex.outputs.final-message }}
+
+    steps:
+      - name: Check out the base repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the pull request revision
+        shell: bash
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pull_number }}
+        run: |
+          set -euo pipefail
+
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/coznt-pr-${PR_NUMBER}"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          git show "$BASE_SHA:.github/codex/prompts/pr-review.md" \
+            > "$RUNNER_TEMP/coznt-pr-review-prompt.md"
+          git checkout --detach "$HEAD_SHA"
+
+          echo "CODEX_REVIEW_BASE_SHA=$merge_base" >> "$GITHUB_ENV"
+          echo "CODEX_REVIEW_HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+
+      - name: Run Codex CLI review
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/coznt-pr-review-prompt.md
+          permission-profile: ":read-only"
+          allow-bot-users: ${{ github.actor }}
+
+  publish:
+    name: Publish review to Actions summary
+    needs: review
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Add Codex review to job summary
+        shell: bash
+        env:
+          REVIEW_RESULT: ${{ needs.review.outputs.final_message }}
+          REVIEW_JOB_RESULT: ${{ needs.review.result }}
+          PR_NUMBER: ${{ inputs.pull_number }}
+          PR_TITLE: ${{ inputs.pr_title }}
+          PR_URL: ${{ inputs.pr_url }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          {
+            echo "# Codex PR Review"
+            echo
+            printf '**Pull request:** [#%s - %s](%s)\n\n' "$PR_NUMBER" "$PR_TITLE" "$PR_URL"
+            printf '**Reviewed commit:** `%s`\n\n' "$HEAD_SHA"
+
+            if [[ "$REVIEW_JOB_RESULT" != "success" ]]; then
+              echo "> Codex review failed. Open the **Run Codex code review** job for logs."
+            elif [[ -z "$REVIEW_RESULT" ]]; then
+              echo "Codex completed without returning a review message."
+            else
+              printf '%s\n' "$REVIEW_RESULT"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
